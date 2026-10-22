@@ -1,0 +1,7 @@
+node_modules/
+.env
+study-buddy.db
+study-buddy.db-shm
+study-buddy.db-wal
+client/dist/
+npm-debug.log*

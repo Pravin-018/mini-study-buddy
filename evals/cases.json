@@ -1,0 +1,22 @@
+[
+  {
+    "question": "Explain inheritance in Java in beginner-friendly language and give a small example.",
+    "expected_keywords": ["class", "inherit", "parent"]
+  },
+  {
+    "question": "What is a variable in programming? Explain briefly.",
+    "expected_keywords": ["store", "value"]
+  },
+  {
+    "question": "Explain photosynthesis in two or three simple sentences.",
+    "expected_keywords": ["sunlight", "plant", "energy"]
+  },
+  {
+    "question": "What is the difference between mitosis and meiosis?",
+    "expected_keywords": ["cells", "chromosomes", "daughter"]
+  },
+  {
+    "question": "Make a short study plan for learning fractions in 30 minutes.",
+    "expected_keywords": ["plan", "minutes", "practice"]
+  }
+]

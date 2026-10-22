@@ -1,0 +1,35 @@
+{
+  "name": "mini-ai-study-buddy",
+  "version": "1.0.0",
+  "description": "Beginner-friendly AI study buddy with chat, notes, and study planning",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "prestart": "npm run build",
+    "dev": "concurrently -k \"npm:server:dev\" \"npm:client:dev\"",
+    "server:dev": "node --watch server.js",
+    "client:dev": "vite --config vite.config.js",
+    "build": "vite build --config vite.config.js",
+    "eval": "node evals/run-evals.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "bcryptjs": "^2.4.3",
+    "concurrently": "^9.1.2",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "express-session": "^1.18.1",
+    "jsonwebtoken": "^9.0.2",
+    "openai": "^4.85.0",
+    "passport": "^0.7.0",
+    "passport-google-oauth20": "^2.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.18.4",
+    "vite": "^6.1.0"
+  }
+}

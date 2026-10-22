@@ -23,6 +23,9 @@ The app starts without an OpenAI key. In that case, chat and planner responses a
 ## Project structure
 
 ```text
+HLD.md
+LLD.md
+PRD.md
 client/
   index.html
   src/
@@ -45,6 +48,8 @@ package.json
 vite.config.js
 .env.example
 ```
+
+The design and product documents are [PRD.md](./PRD.md) (requirements), [HLD.md](./HLD.md) (system architecture), and [LLD.md](./LLD.md) (implementation details and API contracts).
 
 ## Prerequisites and setup
 

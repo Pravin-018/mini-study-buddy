@@ -2,14 +2,20 @@
 
 ## 1. Scope
 
-This document describes the current implementation-level design of Mini AI Study Buddy. The application is a JavaScript ES-module project with a React/Vite frontend, an Express API, a SQLite database, and optional OpenAI and Google OAuth integrations.
+This document describes the current implementation-level design of Mini AI Study Buddy. The application is a JavaScript ES-module project with a React/Vite frontend, an Express API, MongoDB through Mongoose, and optional OpenAI and Google OAuth integrations.
 
 ## 2. Source module responsibilities
 
 | File | Responsibility |
 |---|---|
-| `server.js` | Express setup, SQLite schema and migrations, CORS/body limits, rate limiting, authentication and OAuth routes, application APIs, SSE, static frontend hosting, and error handling. |
-| `src/auth.js` | JWT/cookie authentication middleware and database-backed admin-role enforcement. |
+| `server.js` | Express setup, MongoDB-backed APIs, CORS/body limits, rate limiting, authentication and OAuth routes, SSE, static frontend hosting, and error handling. |
+| `src/db.js` | MongoDB connection configuration and startup connection handling. |
+| `src/models/User.js` | User schema, validation, timestamps, and unique email/Google ID indexes. |
+| `src/models/Note.js` | Note schema, user reference, embedding vector, timestamps, and owner index. |
+| `src/models/Chat.js` | Chat schema with owner reference and embedded messages. |
+| `src/models/UsageLog.js` | AI usage schema and user/date indexes. |
+| `src/models.test.js` | Focused schema validation and index tests. |
+| `src/auth.js` | JWT/cookie authentication middleware and MongoDB-backed admin-role enforcement. |
 | `src/agent.js` | OpenAI Responses API calls, `create_study_plan` function definition and argument validation, structured planner output validation, streaming text, token extraction, and cost estimation. |
 | `src/rag.js` | Note embedding generation, user-scoped note selection, cosine similarity, and lexical fallback retrieval. |
 | `client/src/App.jsx` | Authentication context, API helper, route guards, page and form behavior, chat SSE consumption, notes and planner workflows, and admin displays. |
@@ -18,12 +24,12 @@ This document describes the current implementation-level design of Mini AI Study
 | `prompts/tutor.md` | Tutor behavior instructions, beginner-friendly response guidance, and treatment of untrusted questions and notes. |
 | `evals/cases.json` | Five study-question evaluation examples and expected keywords. |
 | `evals/run-evals.js` | Runs keyword-based checks against the configured OpenAI model. |
-| `src/agent.test.js` | Unit coverage for demo planning, validation, streamed demo answers, retrieval ownership, and cost estimates. |
-| `src/server.test.js` | API integration coverage for auth, authorization, migration, note/chat ownership, SSE demo chat, and planner behavior. |
+| `src/agent.test.js` | Unit coverage for demo planning, validation, streamed demo answers, MongoDB retrieval ownership and embeddings, and cost estimates. |
+| `src/server.test.js` | API integration coverage against an ephemeral MongoDB server for auth, authorization, note CRUD/ownership, chat ownership, SSE demo chat, and planner behavior. |
 
 ## 3. HTTP API
 
-All JSON errors use the shape `{ "error": "..." }`. Protected endpoints require a valid bearer JWT or the OAuth `study_buddy_token` cookie. Identifiers in path parameters must be positive safe integers.
+All JSON errors use the shape `{ "error": "..." }`. Protected endpoints require a valid bearer JWT or the OAuth `study_buddy_token` cookie. Resource identifiers in path parameters must be valid MongoDB ObjectIds.
 
 ### Authentication and status
 
@@ -42,7 +48,9 @@ All JSON errors use the shape `{ "error": "..." }`. Protected endpoints require 
 | Method and path | Auth | Behavior |
 |---|---|---|
 | `GET /api/notes` | Required | Lists only the current user's notes. |
+| `GET /api/notes/:id` | Required | Returns one note only if it belongs to the current user. |
 | `POST /api/notes` | Required | Requires a nonempty title (maximum 120 characters) and content (maximum 8,000 characters); optionally generates an embedding. |
+| `PUT /api/notes/:id`, `PATCH /api/notes/:id` | Required | Replaces the note title/content and refreshes the embedding, only when owned by the current user. |
 | `DELETE /api/notes/:id` | Required | Deletes only a note owned by the current user; returns 404 if it is not owned or does not exist. |
 
 ### Chats
@@ -52,7 +60,7 @@ All JSON errors use the shape `{ "error": "..." }`. Protected endpoints require 
 | `POST /api/chat` | Required | Accepts a question (maximum 2,000 characters) and optional owned `chatId`; streams SSE text, note sources, and completion metadata. |
 | `GET /api/chats` | Required | Lists the current user's chat summaries and latest messages. |
 | `GET /api/chats/:id` | Required | Returns one owned chat and its ordered messages. |
-| `DELETE /api/chats/:id` | Required | Deletes only an owned chat; related messages are removed by the foreign key cascade. |
+| `DELETE /api/chats/:id` | Required | Deletes only an owned chat; embedded messages are removed with it. |
 
 SSE text events use `data: {"text":"..."}`. The terminal success event is `event: done` and includes the chat ID, matching note titles, demo flag, and available usage. Errors after the stream starts are sent as `event: error`.
 
@@ -66,69 +74,37 @@ SSE text events use `data: {"text":"..."}`. The terminal success event is `event
 | `GET /api/admin/users` | Admin | Returns up to 200 user summaries and per-user AI request counts. |
 | `GET /api/admin/usage` | Admin | Returns up to 100 recent usage records with account email. |
 
-## 4. Database schema
+## 4. MongoDB schema
 
-The schema is initialized in `server.js`; SQLite foreign-key enforcement is enabled.
+Schemas are defined in `src/models/`; the server connects through `src/db.js` and waits for Mongoose model indexes before accepting requests.
 
-```sql
-users (
-  id INTEGER PRIMARY KEY,
-  email TEXT NOT NULL UNIQUE,
-  password_hash TEXT,
-  role TEXT NOT NULL DEFAULT 'student'
-    CHECK(role IN ('student', 'admin')),
-  google_id TEXT UNIQUE,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)
+| Model | Important fields and validation |
+|---|---|
+| `User` | Required trimmed `name` and unique, lowercase `email`; `password` contains a bcrypt hash and is excluded from query results by default. Local accounts require a password hash; OAuth-only accounts use `googleId`. `role` is restricted to `student` or `admin`. `createdAt` is timestamped. |
+| `Note` | Required `userId` ObjectId reference to `User`, required title (max 120) and content (max 8,000), and optional numeric `embedding` array. Mongoose maintains `createdAt` and `updatedAt`. |
+| `Chat` | Required `userId` reference and title; messages are embedded documents containing role (`user` or `assistant`), content, and creation time. Mongoose maintains chat timestamps. |
+| `UsageLog` | Required `userId` reference, model, nonnegative input/output token counts, nonnegative estimated cost, and `createdAt`. |
 
-notes (
-  id INTEGER PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  content TEXT NOT NULL,
-  embedding TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)
+MongoDB references express ownership relationships but do not enforce relational foreign keys. Every private-resource query includes the authenticated owner's ObjectId, so a valid resource ID alone never grants access.
 
-chats (
-  id INTEGER PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)
+Indexes:
 
-messages (
-  id INTEGER PRIMARY KEY,
-  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-  role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-  content TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)
-
-usage_logs (
-  id INTEGER PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  model TEXT NOT NULL,
-  input_tokens INTEGER NOT NULL DEFAULT 0,
-  output_tokens INTEGER NOT NULL DEFAULT 0,
-  estimated_cost_usd REAL NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)
-```
-
-Indexes are created for `notes.user_id`, `chats.user_id`, `messages.chat_id`, and `usage_logs.user_id`. Startup compatibility logic adds selected missing legacy columns and migrates an older `usage` table once. Notes without an owner are not returned to authenticated users.
+- `User.email` unique: prevents duplicate accounts regardless of concurrent registrations.
+- `User.googleId` unique and sparse: prevents linking one Google identity to multiple accounts while allowing accounts without OAuth.
+- `Note.userId` and `Chat.userId`: accelerate user-scoped note and chat retrieval.
+- `UsageLog` `{ userId: 1, createdAt: -1 }`: accelerates chronological per-user usage history.
+- `UsageLog` `{ createdAt: -1 }`: accelerates global recent usage reporting.
 
 ## 5. Authentication and authorization details
 
 - Registration accepts an email and password; password length is at least 8 characters and at most 72 UTF-8 bytes to match bcrypt's input limit.
 - Password hashes use bcryptjs with work factor 12.
 - JWTs contain the user ID and expire after two hours.
-- `requireAuth` accepts the `Authorization: Bearer <token>` header or OAuth cookie, verifies the JWT, then reads `id`, `email`, and `role` from the database.
+- `requireAuth` accepts the `Authorization: Bearer <token>` header or OAuth cookie, verifies the JWT, then reloads the user and role from MongoDB.
 - `requireAdmin` allows the request only when the loaded database role is `admin`.
 - New accounts are assigned `student` regardless of submitted role fields.
 - Notes and chats are retrieved, deleted, and updated using both the resource ID and authenticated user ID.
-- Admin promotion is a local database operation described in `README.md`; no public promotion endpoint exists.
+- Admin promotion is a local MongoDB operation described in `README.md`; no public promotion endpoint exists.
 
 ## 6. AI and retrieval details
 
@@ -150,8 +126,9 @@ The planner requests a strict JSON-schema object with `topic` and `tasks`. Each 
 
 ### Retrieval
 
-- Notes are selected with `WHERE user_id = ?`.
+- Notes are selected with `Note.find({ userId: authenticatedUserId })`.
 - When live embeddings are available, note and query vectors are compared using cosine similarity; up to three results above the similarity threshold are selected.
+- Embeddings are stored as numeric arrays in MongoDB. Updating note content regenerates the embedding when the OpenAI client is configured.
 - Notes without embeddings use lexical scoring.
 - Without a configured OpenAI client, all candidates use simple lexical overlap and only positive matches are returned.
 - Retrieved note content is input context only; it cannot authorize API operations or bypass server-side checks.
@@ -167,7 +144,7 @@ Usage is recorded for completed live AI chat and planner responses when token us
 - Authentication limiter: 20 requests per 15 minutes per IP.
 - Chat limiter: 12 requests per minute per IP.
 - Email, password, text fields, difficulty, numeric ranges, and resource IDs are validated before use.
-- SQL uses parameter placeholders for user-provided values.
+- MongoDB ObjectIds, schema validation, bounded input fields, and owner-scoped query filters are used for persisted resources.
 - Provider failures are logged server-side and returned as explicit API or SSE errors.
 - Aborted/disconnected chat requests cancel the provider request when supported by the SDK.
 - CORS origins are restricted to `CORS_ORIGIN` (or the local development defaults).
@@ -191,7 +168,7 @@ The route guard improves navigation but is not an authorization boundary; server
 
 ## 9. Configuration and commands
 
-- `.env.example` documents configuration for the API port, CORS origins, JWT signing secret, OpenAI models and API key, token rates, and Google OAuth.
+- `.env.example` documents `MONGODB_URI`, API port, CORS origins, JWT signing secret, OpenAI models and API key, token rates, and Google OAuth.
 - Development: `npm run dev`.
 - Production-style local run: `npm start` (builds the frontend first).
 - Frontend build: `npm run build`.

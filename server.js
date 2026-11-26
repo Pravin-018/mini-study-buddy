@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import mongoose from 'mongoose';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cors from 'cors';
@@ -8,105 +9,28 @@ import cookieParser from 'cookie-parser';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import OpenAI from 'openai';
-import { DatabaseSync } from 'node:sqlite';
 import rateLimit from 'express-rate-limit';
 import passport from 'passport';
 import session from 'express-session';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import { requireAuth, requireAdmin } from './src/auth.js';
 import { answerWithAgent, createStudyPlan, estimateCost, MODEL } from './src/agent.js';
-import { retrieveNotes, addNote } from './src/rag.js';
+import { retrieveNotes, addNote, generateEmbedding } from './src/rag.js';
+import { connectDatabase } from './src/db.js';
+import User from './src/models/User.js';
+import Note from './src/models/Note.js';
+import Chat from './src/models/Chat.js';
+import UsageLog from './src/models/UsageLog.js';
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
 const root = path.dirname(fileURLToPath(import.meta.url));
-const db = new DatabaseSync(process.env.DATABASE_PATH || path.join(root, 'study-buddy.db'));
 const secret = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
 if (!process.env.JWT_SECRET) console.warn('JWT_SECRET is not set; using an ephemeral key. Sessions will expire when the server restarts.');
 if (process.env.JWT_SECRET && process.env.JWT_SECRET.length < 32) {
   throw new Error('JWT_SECRET must contain at least 32 characters.');
 }
 
-db.exec('PRAGMA foreign_keys = ON');
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY,
-  email TEXT NOT NULL UNIQUE,
-  password_hash TEXT,
-  role TEXT NOT NULL DEFAULT 'student' CHECK(role IN ('student','admin')),
-  google_id TEXT UNIQUE,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS notes (
-  id INTEGER PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  content TEXT NOT NULL,
-  embedding TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS chats (
-  id INTEGER PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY,
-  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-  role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-  content TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS usage_logs (
-  id INTEGER PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  model TEXT NOT NULL,
-  input_tokens INTEGER NOT NULL DEFAULT 0,
-  output_tokens INTEGER NOT NULL DEFAULT 0,
-  estimated_cost_usd REAL NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS schema_migrations (
-  name TEXT PRIMARY KEY,
-  applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-`);
-function hasColumn(table, column) {
-  return db.prepare(`PRAGMA table_info(${table})`).all().some(row => row.name === column);
-}
-if (!hasColumn('users', 'created_at')) {
-  db.exec('ALTER TABLE users ADD COLUMN created_at TEXT');
-  db.exec('UPDATE users SET created_at=CURRENT_TIMESTAMP WHERE created_at IS NULL');
-}
-if (!hasColumn('notes', 'user_id')) db.exec('ALTER TABLE notes ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE');
-if (!hasColumn('notes', 'created_at')) {
-  db.exec('ALTER TABLE notes ADD COLUMN created_at TEXT');
-  db.exec('UPDATE notes SET created_at=CURRENT_TIMESTAMP WHERE created_at IS NULL');
-}
-db.exec(`
-CREATE INDEX IF NOT EXISTS notes_user_id_idx ON notes(user_id);
-CREATE INDEX IF NOT EXISTS chats_user_id_idx ON chats(user_id);
-CREATE INDEX IF NOT EXISTS messages_chat_id_idx ON messages(chat_id);
-CREATE INDEX IF NOT EXISTS usage_user_id_idx ON usage_logs(user_id);
-`);
-const legacyUsageColumns = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage'").get()
-  ? db.prepare('PRAGMA table_info(usage)').all().map(row => row.name) : [];
-const hasUsageMigration = db.prepare("SELECT 1 FROM schema_migrations WHERE name='legacy_usage_v1'").get();
-if (!hasUsageMigration && ['user_id', 'model', 'input_tokens', 'output_tokens', 'estimated_cost_usd', 'created_at'].every(column => legacyUsageColumns.includes(column))) {
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    db.exec(`INSERT INTO usage_logs (user_id,model,input_tokens,output_tokens,estimated_cost_usd,created_at)
-      SELECT user_id,model,input_tokens,output_tokens,estimated_cost_usd,created_at FROM usage`);
-    db.prepare("INSERT INTO schema_migrations (name) VALUES ('legacy_usage_v1')").run();
-    db.exec('COMMIT');
-  } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
-  }
-}
-app.locals.db = db;
 app.locals.jwtSecret = secret;
 
 const client = process.env.OPENAI_API_KEY
@@ -129,14 +53,23 @@ app.use('/api/auth', rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeade
 app.use('/api/chat', rateLimit({ windowMs: 60_000, limit: 12, standardHeaders: true, legacyHeaders: false, handler: rateLimitHandler }));
 
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const issueToken = user => jwt.sign({ id: user.id }, secret, { expiresIn: '2h' });
-const publicUser = user => ({ id: user.id, email: user.email, role: user.role });
+const userId = user => user._id.toString();
+const issueToken = user => jwt.sign({ id: userId(user) }, secret, { expiresIn: '2h' });
+const publicUser = user => ({ id: userId(user), email: user.email, role: user.role });
 function bodyString(body, key, maxLength) {
   return typeof body?.[key] === 'string' ? body[key].trim().slice(0, maxLength) : '';
 }
+function defaultName(email) {
+  return email.split('@')[0].slice(0, 120);
+}
 function validateId(value) {
-  const id = Number(value);
-  return Number.isSafeInteger(id) && id > 0 ? id : null;
+  return mongoose.isObjectIdOrHexString(value) ? value : null;
+}
+function formatDate(value) {
+  return new Date(value).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+}
+function asyncHandler(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
 function sendError(res, status, error) {
   res.status(status).json({ error });
@@ -145,7 +78,7 @@ function errorStatus(error) {
   return error?.status === 401 || error?.status === 403 || error?.status === 429 ? error.status : 502;
 }
 
-const registerHandler = async (req, res) => {
+const registerHandler = asyncHandler(async (req, res) => {
   const email = bodyString(req.body, 'email', 254).toLowerCase();
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
   if (!emailPattern.test(email) || password.length < 8 || Buffer.byteLength(password, 'utf8') > 72) {
@@ -153,27 +86,29 @@ const registerHandler = async (req, res) => {
   }
   try {
     const passwordHash = await bcrypt.hash(password, 12);
-    const result = db.prepare('INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)').run(email, passwordHash);
-    const user = { id: Number(result.lastInsertRowid), email, role: 'student' };
-    res.status(201).json({ token: issueToken(user), user, role: user.role });
+    const user = await User.create({
+      name: bodyString(req.body, 'name', 120) || defaultName(email),
+      email,
+      password: passwordHash
+    });
+    res.status(201).json({ token: issueToken(user), user: publicUser(user), role: user.role });
   } catch (error) {
-    if (error.errcode === 2067 || error.message.includes('UNIQUE constraint failed: users.email')) {
+    if (error.code === 11000) {
       return sendError(res, 409, 'That email is already registered.');
     }
-    console.error('Registration failed:', error);
-    return sendError(res, 500, 'Could not create your account.');
+    throw error;
   }
-};
-const loginHandler = async (req, res) => {
+});
+const loginHandler = asyncHandler(async (req, res) => {
   const email = bodyString(req.body, 'email', 254).toLowerCase();
   const password = typeof req.body?.password === 'string' && Buffer.byteLength(req.body.password, 'utf8') <= 72
     ? req.body.password : '';
-  const user = db.prepare('SELECT id,email,password_hash,role FROM users WHERE email=?').get(email);
-  if (!user?.password_hash || !(await bcrypt.compare(password, user.password_hash))) {
+  const user = await User.findOne({ email }).select('+password');
+  if (!user?.password || !(await bcrypt.compare(password, user.password))) {
     return sendError(res, 401, 'Invalid email or password.');
   }
   res.json({ token: issueToken(user), user: publicUser(user), role: user.role });
-};
+});
 app.post(['/api/auth/register', '/api/register'], registerHandler);
 app.post(['/api/auth/login', '/api/login'], loginHandler);
 app.post('/api/auth/logout', (req, res) => {
@@ -196,19 +131,23 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
     clientSecret: process.env.GOOGLE_CLIENT_SECRET,
     callbackURL: process.env.GOOGLE_CALLBACK_URL || `http://localhost:${port}/auth/google/callback`,
     state: true
-  }, (accessToken, refreshToken, profile, done) => {
+  }, async (accessToken, refreshToken, profile, done) => {
     try {
       const email = profile.emails?.[0]?.value?.trim().toLowerCase();
       if (!email || !emailPattern.test(email) || profile._json?.email_verified !== true) {
         return done(new Error('Google account did not provide a verified email.'));
       }
-      let user = db.prepare('SELECT id,email,role,google_id FROM users WHERE google_id=? OR email=?').get(profile.id, email);
+      let user = await User.findOne({ $or: [{ googleId: profile.id }, { email }] });
       if (!user) {
-        const result = db.prepare('INSERT INTO users (email,role,google_id,created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)').run(email, 'student', profile.id);
-        user = { id: Number(result.lastInsertRowid), email, role: 'student', google_id: profile.id };
-      } else if (!user.google_id) {
-        db.prepare('UPDATE users SET google_id=? WHERE id=?').run(profile.id, user.id);
-        user.google_id = profile.id;
+        user = await User.create({
+          name: profile.displayName?.trim().slice(0, 120) || defaultName(email),
+          email,
+          googleId: profile.id
+        });
+      } else if (!user.googleId) {
+        user.googleId = profile.id;
+        if (!user.name) user.name = profile.displayName?.trim().slice(0, 120) || defaultName(email);
+        await user.save();
       }
       done(null, user);
     } catch (error) { done(error); }
@@ -228,52 +167,103 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
   app.get('/auth/google', (req, res) => sendError(res, 503, 'Google sign-in is not configured.'));
 }
 
-app.get('/api/notes', requireAuth, (req, res) => {
-  res.json(db.prepare('SELECT id,title,content,created_at FROM notes WHERE user_id=? ORDER BY id DESC').all(req.user.id));
-});
-app.post('/api/notes', requireAuth, async (req, res) => {
+app.get('/api/notes', requireAuth, asyncHandler(async (req, res) => {
+  const notes = await Note.find({ userId: req.user.id })
+    .select('title content createdAt')
+    .sort({ createdAt: -1, _id: -1 })
+    .lean();
+  res.json(notes.map(note => ({
+    id: note._id.toString(),
+    title: note.title,
+    content: note.content,
+    created_at: formatDate(note.createdAt)
+  })));
+}));
+app.get('/api/notes/:id', requireAuth, asyncHandler(async (req, res) => {
+  const id = validateId(req.params.id);
+  if (!id) return sendError(res, 400, 'Invalid note ID.');
+  const note = await Note.findOne({ _id: id, userId: req.user.id })
+    .select('title content createdAt updatedAt')
+    .lean();
+  if (!note) return sendError(res, 404, 'Note not found.');
+  res.json({
+    id: note._id.toString(),
+    title: note.title,
+    content: note.content,
+    created_at: formatDate(note.createdAt),
+    updated_at: formatDate(note.updatedAt)
+  });
+}));
+app.post('/api/notes', requireAuth, asyncHandler(async (req, res) => {
   const title = bodyString(req.body, 'title', 120);
   const content = bodyString(req.body, 'content', 8000);
   if (!title || !content) return sendError(res, 400, 'Title and note content are required.');
-  try {
-    const id = await addNote(client, db, req.user.id, title, content);
-    res.status(201).json({ id });
-  } catch (error) {
-    console.error('Note save failed:', error);
-    sendError(res, 502, 'Could not save the note. Check the AI provider settings and try again.');
-  }
-});
-app.delete('/api/notes/:id', requireAuth, (req, res) => {
+  const id = await addNote(client, req.user.id, title, content);
+  res.status(201).json({ id });
+}));
+const updateNoteHandler = asyncHandler(async (req, res) => {
   const id = validateId(req.params.id);
   if (!id) return sendError(res, 400, 'Invalid note ID.');
-  const result = db.prepare('DELETE FROM notes WHERE id=? AND user_id=?').run(id, req.user.id);
-  if (!result.changes) return sendError(res, 404, 'Note not found.');
+  const title = bodyString(req.body, 'title', 120);
+  const content = bodyString(req.body, 'content', 8000);
+  if (!title || !content) return sendError(res, 400, 'Title and note content are required.');
+  if (!await Note.exists({ _id: id, userId: req.user.id })) return sendError(res, 404, 'Note not found.');
+  const embedding = await generateEmbedding(client, content);
+  const note = await Note.findOneAndUpdate(
+    { _id: id, userId: req.user.id },
+    { $set: { title, content, embedding } },
+    { new: true, runValidators: true }
+  ).select('_id');
+  if (!note) return sendError(res, 404, 'Note not found.');
+  res.json({ id: note._id.toString() });
+});
+app.put('/api/notes/:id', requireAuth, updateNoteHandler);
+app.patch('/api/notes/:id', requireAuth, updateNoteHandler);
+app.delete('/api/notes/:id', requireAuth, asyncHandler(async (req, res) => {
+  const id = validateId(req.params.id);
+  if (!id) return sendError(res, 400, 'Invalid note ID.');
+  const note = await Note.findOneAndDelete({ _id: id, userId: req.user.id });
+  if (!note) return sendError(res, 404, 'Note not found.');
   res.json({ ok: true });
-});
+}));
 
-app.get('/api/chats', requireAuth, (req, res) => {
-  const chats = db.prepare(`SELECT c.id,c.title,c.created_at,c.updated_at,
-    (SELECT content FROM messages WHERE chat_id=c.id ORDER BY id DESC LIMIT 1) AS last_message
-    FROM chats c WHERE c.user_id=? ORDER BY c.updated_at DESC`).all(req.user.id);
-  res.json(chats);
-});
-app.get('/api/chats/:id', requireAuth, (req, res) => {
+app.get('/api/chats', requireAuth, asyncHandler(async (req, res) => {
+  const chats = await Chat.find({ userId: req.user.id }).sort({ updatedAt: -1 }).lean();
+  res.json(chats.map(chat => ({
+    id: chat._id.toString(),
+    title: chat.title,
+    created_at: formatDate(chat.createdAt),
+    updated_at: formatDate(chat.updatedAt),
+    last_message: chat.messages.at(-1)?.content || null
+  })));
+}));
+app.get('/api/chats/:id', requireAuth, asyncHandler(async (req, res) => {
   const id = validateId(req.params.id);
   if (!id) return sendError(res, 400, 'Invalid chat ID.');
-  const chat = db.prepare('SELECT id,title,created_at,updated_at FROM chats WHERE id=? AND user_id=?').get(id, req.user.id);
+  const chat = await Chat.findOne({ _id: id, userId: req.user.id }).lean();
   if (!chat) return sendError(res, 404, 'Chat not found.');
-  chat.messages = db.prepare('SELECT id,role,content,created_at FROM messages WHERE chat_id=? ORDER BY id').all(id);
-  res.json(chat);
-});
-app.delete('/api/chats/:id', requireAuth, (req, res) => {
+  res.json({
+    id: chat._id.toString(),
+    title: chat.title,
+    created_at: formatDate(chat.createdAt),
+    updated_at: formatDate(chat.updatedAt),
+    messages: chat.messages.map(message => ({
+      id: message._id.toString(),
+      role: message.role,
+      content: message.content,
+      created_at: formatDate(message.createdAt)
+    }))
+  });
+}));
+app.delete('/api/chats/:id', requireAuth, asyncHandler(async (req, res) => {
   const id = validateId(req.params.id);
   if (!id) return sendError(res, 400, 'Invalid chat ID.');
-  const result = db.prepare('DELETE FROM chats WHERE id=? AND user_id=?').run(id, req.user.id);
-  if (!result.changes) return sendError(res, 404, 'Chat not found.');
+  const chat = await Chat.findOneAndDelete({ _id: id, userId: req.user.id });
+  if (!chat) return sendError(res, 404, 'Chat not found.');
   res.json({ ok: true });
-});
+}));
 
-app.post('/api/chat', requireAuth, async (req, res) => {
+app.post('/api/chat', requireAuth, asyncHandler(async (req, res) => {
   const question = bodyString(req.body, 'question', 2000);
   const requestedChatId = req.body?.chatId === undefined || req.body.chatId === null ? null : validateId(req.body.chatId);
   if (!question) return sendError(res, 400, 'Ask a question first.');
@@ -282,14 +272,19 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     console.warn(`Prompt-injection warning for chat request from user ${req.user.id}.`);
   }
   let chatId = requestedChatId;
+  const firstMessage = { role: 'user', content: question };
   if (chatId) {
-    const owned = db.prepare('SELECT id FROM chats WHERE id=? AND user_id=?').get(chatId, req.user.id);
-    if (!owned) return sendError(res, 404, 'Chat not found.');
+    const chat = await Chat.findOneAndUpdate(
+      { _id: chatId, userId: req.user.id },
+      { $push: { messages: firstMessage } },
+      { new: true }
+    ).select('_id');
+    if (!chat) return sendError(res, 404, 'Chat not found.');
   } else {
     const title = question.length > 64 ? `${question.slice(0, 61)}...` : question;
-    chatId = Number(db.prepare('INSERT INTO chats (user_id,title) VALUES (?,?)').run(req.user.id, title).lastInsertRowid);
+    const chat = await Chat.create({ userId: req.user.id, title, messages: [firstMessage] });
+    chatId = chat.id;
   }
-  db.prepare('INSERT INTO messages (chat_id,role,content) VALUES (?, ?, ?)').run(chatId, 'user', question);
   const controller = new AbortController();
   const abortOnDisconnect = () => {
     if (!res.writableEnded) controller.abort();
@@ -297,7 +292,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   res.on('close', abortOnDisconnect);
   let notes;
   try {
-    notes = await retrieveNotes(client, db, req.user.id, question, controller.signal);
+    notes = await retrieveNotes(client, req.user.id, question, controller.signal);
     if (controller.signal.aborted) return;
     res.status(200);
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -310,13 +305,20 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (!controller.signal.aborted && !res.destroyed) res.write(`data: ${JSON.stringify({ text })}\n\n`);
       }
     });
-    db.prepare('INSERT INTO messages (chat_id,role,content) VALUES (?, ?, ?)').run(chatId, 'assistant', result.text);
-    db.prepare('UPDATE chats SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(chatId);
+    await Chat.findOneAndUpdate(
+      { _id: chatId, userId: req.user.id },
+      { $push: { messages: { role: 'assistant', content: result.text } } }
+    );
     if (!result.demo) {
       const usage = result.usage;
       const cost = estimateCost(usage.inputTokens, usage.outputTokens);
-      db.prepare('INSERT INTO usage_logs (user_id,model,input_tokens,output_tokens,estimated_cost_usd) VALUES (?,?,?,?,?)')
-        .run(req.user.id, MODEL, usage.inputTokens, usage.outputTokens, cost);
+      await UsageLog.create({
+        userId: req.user.id,
+        model: MODEL,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        estimatedCostUsd: cost
+      });
     }
     res.write(`event: done\ndata: ${JSON.stringify({ chatId, notes: notes.map(note => ({ id: note.id, title: note.title })), demo: result.demo, usage: result.usage || null })}\n\n`);
     res.end();
@@ -331,9 +333,9 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   } finally {
     res.off('close', abortOnDisconnect);
   }
-});
+}));
 
-app.post('/api/study-plan', requireAuth, async (req, res) => {
+app.post('/api/study-plan', requireAuth, asyncHandler(async (req, res) => {
   const topic = bodyString(req.body, 'topic', 160);
   const minutes = Number(req.body?.minutes);
   const difficulty = bodyString(req.body, 'difficulty', 20);
@@ -344,37 +346,91 @@ app.post('/api/study-plan', requireAuth, async (req, res) => {
   try {
     const plan = await createStudyPlan(client, { topic, minutes, difficulty });
     if (!plan.demo) {
-      db.prepare('INSERT INTO usage_logs (user_id,model,input_tokens,output_tokens,estimated_cost_usd) VALUES (?,?,?,?,?)')
-        .run(req.user.id, MODEL, plan.usage.inputTokens, plan.usage.outputTokens,
-          estimateCost(plan.usage.inputTokens, plan.usage.outputTokens));
+      await UsageLog.create({
+        userId: req.user.id,
+        model: MODEL,
+        inputTokens: plan.usage.inputTokens,
+        outputTokens: plan.usage.outputTokens,
+        estimatedCostUsd: estimateCost(plan.usage.inputTokens, plan.usage.outputTokens)
+      });
     }
     res.json(plan);
   } catch (error) {
     console.error('Study plan generation failed:', error);
     sendError(res, errorStatus(error), 'Could not generate a study plan. Check the AI provider settings.');
   }
-});
+}));
 
-app.get('/api/usage', requireAuth, (req, res) => {
-  const summary = db.prepare(`SELECT COUNT(*) AS requests,COALESCE(SUM(input_tokens),0) AS input_tokens,
-    COALESCE(SUM(output_tokens),0) AS output_tokens,COALESCE(SUM(estimated_cost_usd),0) AS estimated_cost_usd
-    FROM usage_logs WHERE user_id=?`).get(req.user.id);
-  res.json({ ...summary, recent: db.prepare('SELECT model,input_tokens,output_tokens,estimated_cost_usd,created_at FROM usage_logs WHERE user_id=? ORDER BY id DESC LIMIT 20').all(req.user.id) });
-});
-app.get('/api/admin/stats', requireAuth, requireAdmin, (req, res) => {
-  const users = db.prepare('SELECT COUNT(*) AS total FROM users').get().total;
-  const usage = db.prepare(`SELECT COUNT(*) AS requests,COALESCE(SUM(input_tokens+output_tokens),0) AS total_tokens,
-    COALESCE(SUM(estimated_cost_usd),0) AS estimated_cost_usd FROM usage_logs`).get();
-  res.json({ totalUsers: users, ...usage });
-});
-app.get('/api/admin/users', requireAuth, requireAdmin, (req, res) => {
-  res.json(db.prepare(`SELECT u.id,u.email,u.role,u.created_at,COUNT(l.id) AS ai_requests
-    FROM users u LEFT JOIN usage_logs l ON l.user_id=u.id GROUP BY u.id ORDER BY u.id DESC LIMIT 200`).all());
-});
-app.get('/api/admin/usage', requireAuth, requireAdmin, (req, res) => {
-  res.json(db.prepare(`SELECT u.email,l.model,l.input_tokens,l.output_tokens,l.estimated_cost_usd,l.created_at
-    FROM usage_logs l JOIN users u ON u.id=l.user_id ORDER BY l.id DESC LIMIT 100`).all());
-});
+app.get('/api/usage', requireAuth, asyncHandler(async (req, res) => {
+  const [totals] = await UsageLog.aggregate([
+    { $match: { userId: new mongoose.Types.ObjectId(req.user.id) } },
+    { $group: {
+      _id: null,
+      requests: { $sum: 1 },
+      input_tokens: { $sum: '$inputTokens' },
+      output_tokens: { $sum: '$outputTokens' },
+      estimated_cost_usd: { $sum: '$estimatedCostUsd' }
+    } },
+    { $project: { _id: 0, requests: 1, input_tokens: 1, output_tokens: 1, estimated_cost_usd: 1 } }
+  ]);
+  const recent = await UsageLog.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(20).lean();
+  res.json({
+    requests: totals?.requests || 0,
+    input_tokens: totals?.input_tokens || 0,
+    output_tokens: totals?.output_tokens || 0,
+    estimated_cost_usd: totals?.estimated_cost_usd || 0,
+    recent: recent.map(record => ({
+      model: record.model,
+      input_tokens: record.inputTokens,
+      output_tokens: record.outputTokens,
+      estimated_cost_usd: record.estimatedCostUsd,
+      created_at: formatDate(record.createdAt)
+    }))
+  });
+}));
+app.get('/api/admin/stats', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const [totalUsers, totals] = await Promise.all([
+    User.countDocuments(),
+    UsageLog.aggregate([{
+      $group: {
+        _id: null,
+        requests: { $sum: 1 },
+        total_tokens: { $sum: { $add: ['$inputTokens', '$outputTokens'] } },
+        estimated_cost_usd: { $sum: '$estimatedCostUsd' }
+      }
+    }, { $project: { _id: 0, requests: 1, total_tokens: 1, estimated_cost_usd: 1 } }])
+  ]);
+  res.json({ totalUsers, ...(totals[0] || { requests: 0, total_tokens: 0, estimated_cost_usd: 0 }) });
+}));
+app.get('/api/admin/users', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const [users, counts] = await Promise.all([
+    User.find().select('email role createdAt').sort({ createdAt: -1 }).limit(200).lean(),
+    UsageLog.aggregate([{ $group: { _id: '$userId', ai_requests: { $sum: 1 } } }])
+  ]);
+  const countByUser = new Map(counts.map(item => [item._id.toString(), item.ai_requests]));
+  res.json(users.map(user => ({
+    id: user._id.toString(),
+    email: user.email,
+    role: user.role,
+    created_at: formatDate(user.createdAt),
+    ai_requests: countByUser.get(user._id.toString()) || 0
+  })));
+}));
+app.get('/api/admin/usage', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const records = await UsageLog.find().sort({ createdAt: -1 }).limit(100).lean();
+  const users = await User.find({ _id: { $in: records.map(record => record.userId) } })
+    .select('email')
+    .lean();
+  const emailByUser = new Map(users.map(user => [user._id.toString(), user.email]));
+  res.json(records.map(record => ({
+    email: emailByUser.get(record.userId.toString()),
+    model: record.model,
+    input_tokens: record.inputTokens,
+    output_tokens: record.outputTokens,
+    estimated_cost_usd: record.estimatedCostUsd,
+    created_at: formatDate(record.createdAt)
+  })));
+}));
 
 app.use('/api', (req, res) => sendError(res, 404, 'API endpoint not found.'));
 const dist = path.join(root, 'client', 'dist');
@@ -391,7 +447,16 @@ app.use((error, req, res, next) => {
   if (error.message === 'This origin is not allowed.') return sendError(res, 403, error.message);
   if (error.type === 'entity.too.large') return sendError(res, 413, 'Request body is too large.');
   if (error.type === 'entity.parse.failed') return sendError(res, 400, 'Request body must contain valid JSON.');
+  if (error.name === 'ValidationError' || error.name === 'CastError') return sendError(res, 400, 'The submitted data is invalid.');
   sendError(res, 500, 'An unexpected server error occurred.');
 });
 
-app.listen(port, () => console.log(`Study Buddy running at http://localhost:${port}${client ? '' : ' (AI demo mode; set OPENAI_API_KEY for live AI)'}`));
+try {
+  await connectDatabase();
+  await Promise.all([User.init(), Note.init(), Chat.init(), UsageLog.init()]);
+  app.listen(port, () => console.log(`Study Buddy running at http://localhost:${port}${client ? '' : ' (AI demo mode; set OPENAI_API_KEY for live AI)'}`));
+} catch (error) {
+  console.error('Could not start the application because MongoDB is unavailable:', error);
+  await mongoose.disconnect();
+  process.exitCode = 1;
+}

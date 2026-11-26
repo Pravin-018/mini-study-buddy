@@ -126,7 +126,7 @@ Students often switch between notes, question-answer tools, and planning tools w
 - Passwords are stored only as bcrypt hashes.
 - API access is authenticated and roles are determined server-side.
 - Private notes, chats, and usage are always scoped to the authenticated account.
-- Database queries use parameterized SQL for user input.
+- MongoDB queries use validated values and owner-scoped filters for private records.
 - Inputs and IDs are validated; request bodies and request rates are bounded.
 - OAuth credentials, AI keys, and JWT signing secret are environment configuration, not client-side assets.
 - Questions and retrieved notes are untrusted content; prompt-injection defenses are risk reduction, not a security guarantee.
@@ -136,7 +136,7 @@ Students often switch between notes, question-answer tools, and planning tools w
 
 - **Usability:** A beginner should be able to install, run, and demonstrate the application using the README.
 - **Reliability:** Invalid AI responses are rejected by validation; failures are shown rather than disguised as successful live output.
-- **Performance:** Chat output is streamed to reduce perceived wait time. SQLite and in-memory embedding comparisons are intended for small datasets.
+- **Performance:** Chat output is streamed to reduce perceived wait time. User-scoped MongoDB queries and in-memory embedding comparisons are intended for small datasets.
 - **Maintainability:** Backend AI, retrieval, and authentication logic is separated into focused modules; the React UI currently resides primarily in `client/src/App.jsx`.
 - **Configurability:** Port, CORS origins, secrets, model names, OAuth credentials, and price estimates can be configured through environment variables.
 - **Testability:** The project uses Node.js's built-in test runner and supports a separate LLM evaluation command.

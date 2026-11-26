@@ -11,29 +11,31 @@ function cosine(a, b) {
   return normA && normB ? dot / (Math.sqrt(normA) * Math.sqrt(normB)) : 0;
 }
 
+import Note from './models/Note.js';
+
 function lexicalScore(question, content) {
   const words = [...new Set(question.toLowerCase().match(/[a-z0-9]{3,}/g) || [])];
   if (!words.length) return 0;
   const text = content.toLowerCase();
   return words.filter(word => text.includes(word)).length / words.length;
 }
-
-export async function addNote(client, db, userId, title, content) {
-  let embedding = null;
-  if (client) {
-    const response = await client.embeddings.create({
-      model: process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small',
-      input: content
-    });
-    embedding = JSON.stringify(response.data[0].embedding);
-  }
-  const result = db.prepare('INSERT INTO notes (user_id,title,content,embedding,created_at) VALUES (?,?,?,?,CURRENT_TIMESTAMP)')
-    .run(userId, title, content, embedding);
-  return Number(result.lastInsertRowid);
+export async function generateEmbedding(client, content) {
+  if (!client) return null;
+  const response = await client.embeddings.create({
+    model: process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small',
+    input: content
+  });
+  return response.data[0].embedding;
 }
 
-export async function retrieveNotes(client, db, userId, question, signal) {
-  const notes = db.prepare('SELECT id,title,content,embedding FROM notes WHERE user_id=?').all(userId);
+export async function addNote(client, userId, title, content) {
+  const embedding = await generateEmbedding(client, content);
+  const note = await Note.create({ userId, title, content, embedding });
+  return note.id;
+}
+
+export async function retrieveNotes(client, userId, question, signal) {
+  const notes = await Note.find({ userId }).select('title content embedding').lean();
   if (!notes.length) return [];
 
   if (client && notes.some(note => note.embedding)) {
@@ -43,14 +45,14 @@ export async function retrieveNotes(client, db, userId, question, signal) {
     }, { signal });
     const queryEmbedding = response.data[0].embedding;
     return notes.map(note => ({
-      id: note.id,
+      id: note._id.toString(),
       title: note.title,
       content: note.content,
-      score: note.embedding ? cosine(queryEmbedding, JSON.parse(note.embedding)) : lexicalScore(question, note.content)
+      score: note.embedding ? cosine(queryEmbedding, note.embedding) : lexicalScore(question, note.content)
     })).sort((a, b) => b.score - a.score).slice(0, 3).filter(note => note.score > 0.15);
   }
 
   return notes.map(note => ({
-    id: note.id, title: note.title, content: note.content, score: lexicalScore(question, `${note.title} ${note.content}`)
+    id: note._id.toString(), title: note.title, content: note.content, score: lexicalScore(question, `${note.title} ${note.content}`)
   })).sort((a, b) => b.score - a.score).slice(0, 3).filter(note => note.score > 0);
 }

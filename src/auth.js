@@ -1,6 +1,8 @@
 import jwt from 'jsonwebtoken';
+import mongoose from 'mongoose';
+import User from './models/User.js';
 
-export function requireAuth(req, res, next) {
+export async function requireAuth(req, res, next) {
   const authorization = req.headers.authorization || '';
   const token = authorization.startsWith('Bearer ')
     ? authorization.slice(7)
@@ -8,9 +10,10 @@ export function requireAuth(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Please log in to continue.' });
   try {
     const claims = jwt.verify(token, req.app.locals.jwtSecret);
-    const user = req.app.locals.db.prepare('SELECT id,email,role FROM users WHERE id=?').get(claims.id);
+    if (!mongoose.isObjectIdOrHexString(claims.id)) return res.status(401).json({ error: 'Please log in to continue.' });
+    const user = await User.findById(claims.id).select('email role').lean();
     if (!user) return res.status(401).json({ error: 'Please log in to continue.' });
-    req.user = user;
+    req.user = { ...user, id: user._id.toString() };
     next();
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {

@@ -1,18 +1,19 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
+import mongoose from 'mongoose';
+import { MongoMemoryServer } from 'mongodb-memory-server';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
-import { DatabaseSync } from 'node:sqlite';
 import jwt from 'jsonwebtoken';
+import User from './models/User.js';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 let baseUrl;
 let server;
-let tempDirectory;
+let mongo;
+let serverOutput = '';
 let firstToken;
 let secondToken;
 let noteId;
@@ -39,36 +40,27 @@ async function request(pathname, { token, method = 'GET', body, origin } = {}) {
 }
 
 before(async () => {
-  tempDirectory = await mkdtemp(path.join(tmpdir(), 'study-buddy-test-'));
+  mongo = await MongoMemoryServer.create();
   const port = await freePort();
   baseUrl = `http://127.0.0.1:${port}`;
-  const databasePath = path.join(tempDirectory, 'test.db');
-  const legacyDb = new DatabaseSync(databasePath);
-  legacyDb.exec(`CREATE TABLE users (
-    id INTEGER PRIMARY KEY,email TEXT UNIQUE,password_hash TEXT,role TEXT DEFAULT 'student',google_id TEXT
-  );
-  CREATE TABLE notes (id INTEGER PRIMARY KEY,title TEXT,content TEXT,embedding TEXT);
-  CREATE TABLE usage (
-    id INTEGER PRIMARY KEY,user_id INTEGER,model TEXT,input_tokens INTEGER,output_tokens INTEGER,
-    estimated_cost_usd REAL,created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
-  INSERT INTO users (email,role) VALUES ('legacy@example.test','student');
-  INSERT INTO notes (title,content) VALUES ('Unowned legacy note','Must not be exposed to another account.');
-  INSERT INTO usage (user_id,model,input_tokens,output_tokens,estimated_cost_usd) VALUES (1,'legacy-model',8,5,0.0001);`);
-  legacyDb.close();
   server = spawn(process.execPath, ['server.js'], {
     cwd: root,
     env: {
       ...process.env,
       PORT: String(port),
-      DATABASE_PATH: databasePath,
+      MONGODB_URI: mongo.getUri('mini-study-buddy-test'),
       JWT_SECRET: 'test-secret-with-more-than-thirty-two-bytes',
       OPENAI_API_KEY: ''
     },
-    stdio: 'inherit'
+    stdio: ['ignore', 'pipe', 'pipe']
   });
+  server.stdout.setEncoding('utf8');
+  server.stderr.setEncoding('utf8');
+  server.stdout.on('data', chunk => { serverOutput += chunk; });
+  server.stderr.on('data', chunk => { serverOutput += chunk; });
+  server.on('error', error => { serverOutput += `${error.message}\n`; });
   let ready = false;
-  for (let attempt = 0; attempt < 100; attempt++) {
+  for (let attempt = 0; attempt < 300; attempt++) {
     if (server.exitCode !== null) throw new Error(`Test server exited with code ${server.exitCode}.`);
     try {
       const response = await fetch(`${baseUrl}/api/status`);
@@ -76,7 +68,8 @@ before(async () => {
     } catch {}
     await new Promise(resolve => setTimeout(resolve, 100));
   }
-  assert.ok(ready, 'test server should start');
+  assert.ok(ready, `test server should start at ${baseUrl} with ${mongo.getUri('mini-study-buddy-test')} (pid ${server.pid}, exit ${server.exitCode}):\n${serverOutput}`);
+  await mongoose.connect(mongo.getUri('mini-study-buddy-test'));
 });
 
 after(async () => {
@@ -84,7 +77,8 @@ after(async () => {
     server.kill();
     await new Promise(resolve => server.once('exit', resolve));
   }
-  if (tempDirectory) await rm(tempDirectory, { recursive: true, force: true });
+  await mongoose.disconnect();
+  if (mongo) await mongo.stop();
 });
 
 test('auth rejects invalid input and issues student accounts', async () => {
@@ -113,19 +107,30 @@ test('protected routes reject anonymous users and students cannot access admin d
   assert.equal((await request('/api/nonexistent')).status, 404);
   const blockedOrigin = await request('/api/status', { origin: 'https://not-allowed.example' });
   assert.equal(blockedOrigin.status, 403);
+
+  const admin = await User.create({
+    name: 'Admin',
+    email: 'admin@example.test',
+    password: '$2b$12$adminhash',
+    role: 'admin'
+  });
+  const adminToken = jwt.sign({ id: admin.id }, 'test-secret-with-more-than-thirty-two-bytes', { expiresIn: '2h' });
+  const stats = await request('/api/admin/stats', { token: adminToken });
+  assert.equal(stats.status, 200);
+  assert.equal((await stats.json()).totalUsers, 3);
+  assert.equal((await request('/api/admin/users', { token: adminToken })).status, 200);
+  assert.deepEqual(await (await request('/api/admin/usage', { token: adminToken })).json(), []);
 });
 
-test('database migration preserves usage and keeps unowned legacy notes private', async () => {
-  const legacyToken = jwt.sign({ id: 1 }, 'test-secret-with-more-than-thirty-two-bytes', { expiresIn: '2h' });
-  const usageResponse = await request('/api/usage', { token: legacyToken });
+test('usage starts empty for a newly registered account', async () => {
+  const usageResponse = await request('/api/usage', { token: firstToken });
   assert.equal(usageResponse.status, 200);
   const usage = await usageResponse.json();
-  assert.equal(usage.requests, 1);
-  assert.equal(usage.input_tokens, 8);
-  assert.deepEqual(await (await request('/api/notes', { token: firstToken })).json(), []);
+  assert.equal(usage.requests, 0);
+  assert.deepEqual(usage.recent, []);
 });
 
-test('notes are stored and scoped to the account', async () => {
+test('note CRUD is stored in MongoDB and scoped to the account', async () => {
   let response = await request('/api/notes', {
     token: firstToken, method: 'POST',
     body: { title: 'Plant biology', content: 'Plants use sunlight to make food through photosynthesis.' }
@@ -133,10 +138,33 @@ test('notes are stored and scoped to the account', async () => {
   assert.equal(response.status, 201);
   noteId = (await response.json()).id;
   response = await request('/api/notes', { token: firstToken });
-  assert.equal((await response.json()).length, 1);
+  const notes = await response.json();
+  assert.equal(notes.length, 1);
+  assert.equal(notes[0].id, noteId);
+  assert.equal((await request('/api/notes/not-an-object-id', { token: firstToken })).status, 400);
+  response = await request(`/api/notes/${noteId}`, { token: firstToken });
+  assert.equal((await response.json()).content, 'Plants use sunlight to make food through photosynthesis.');
   response = await request('/api/notes', { token: secondToken });
   assert.equal((await response.json()).length, 0);
+  assert.equal((await request(`/api/notes/${noteId}`, { token: secondToken })).status, 404);
+  assert.equal((await request(`/api/notes/${noteId}`, {
+    token: secondToken, method: 'PATCH',
+    body: { title: 'Private edit', content: 'Not allowed.' }
+  })).status, 404);
   assert.equal((await request(`/api/notes/${noteId}`, { token: secondToken, method: 'DELETE' })).status, 404);
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  response = await request(`/api/notes/${noteId}`, {
+    token: firstToken, method: 'PATCH',
+    body: { title: 'Updated plant biology', content: 'Updated photosynthesis note.' }
+  });
+  assert.equal(response.status, 200);
+  response = await request(`/api/notes/${noteId}`, { token: firstToken });
+  const updated = await response.json();
+  assert.equal(updated.title, 'Updated plant biology');
+  assert.equal(updated.content, 'Updated photosynthesis note.');
+  assert.ok(new Date(updated.updated_at) > new Date(updated.created_at));
+  assert.equal((await request(`/api/notes/${noteId}`, { token: firstToken, method: 'DELETE' })).status, 200);
+  assert.equal((await request(`/api/notes/${noteId}`, { token: firstToken })).status, 404);
 });
 
 test('chat streams a labelled demo answer, persists history, and enforces ownership', async () => {
@@ -155,6 +183,12 @@ test('chat streams a labelled demo answer, persists history, and enforces owners
   assert.equal(chat.messages[0].role, 'user');
   assert.equal(chat.messages[1].role, 'assistant');
   assert.match(chat.messages[1].content, /Demo response/);
+  const chats = await (await request('/api/chats', { token: firstToken })).json();
+  assert.equal(chats[0].id, chatId);
+  assert.equal(chats[0].last_message, chat.messages[1].content);
+  assert.deepEqual(await (await request('/api/chats', { token: secondToken })).json(), []);
+  assert.equal((await request(`/api/chats/${chatId}`, { token: secondToken, method: 'DELETE' })).status, 404);
+  assert.equal((await request(`/api/chats/${chatId}`, { token: firstToken, method: 'DELETE' })).status, 200);
 });
 
 test('planner validates input and returns a demo plan without an AI key', async () => {

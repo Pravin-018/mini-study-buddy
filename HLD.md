@@ -16,7 +16,7 @@ Student / Administrator
           v
      Express REST API  <------>  OpenAI API
           |
-          +-------------------> SQLite database
+          +-------------------> MongoDB (Mongoose)
           |
           +-------------------> Google OAuth (optional)
 ```
@@ -43,11 +43,10 @@ The browser uses the same-origin `/api` routes through the Vite development prox
 
 ### Persistence
 
-- SQLite is accessed through Node.js `node:sqlite` (`DatabaseSync`).
-- The database is initialized automatically on server startup.
-- The database path defaults to `study-buddy.db` in the project root and can be overridden with `DATABASE_PATH`.
-- Foreign keys and user-scoped indexes support ownership and lookup operations.
-- Startup migration logic preserves eligible legacy usage records; unowned legacy notes remain hidden.
+- `src/db.js` connects to MongoDB with the required `MONGODB_URI` environment variable.
+- Mongoose models in `src/models/` define users, notes, chats (with embedded messages), and usage logs.
+- The server waits for the connection and model indexes before it listens; a failed connection prevents startup.
+- ObjectId references and owner-scoped queries keep notes, chats, and usage associated with authenticated users.
 
 ### External services
 
@@ -62,7 +61,7 @@ The browser uses the same-origin `/api` routes through the Vite development prox
 1. The browser submits credentials to the authentication API.
 2. The backend validates the email and password, hashes new passwords with bcrypt, and stores accounts with the `student` role.
 3. On successful login or registration, the backend issues an expiring signed JWT.
-4. Protected API requests verify the token and load the current role from SQLite.
+4. Protected API requests verify the token and load the current role from MongoDB.
 
 Google sign-in uses Passport's OAuth state handling, verifies the email, safely links or creates an account, then issues an HTTP-only app-token cookie.
 
@@ -90,7 +89,7 @@ The standalone planner endpoint requests a strict JSON-schema plan and validates
 
 1. Admin pages call protected admin APIs.
 2. The backend checks the verified user's database role.
-3. Aggregate user and usage information is queried from SQLite and returned without password hashes.
+3. Aggregate user and usage information is queried from MongoDB and returned without password hashes.
 
 ## 5. Data model overview
 
@@ -101,19 +100,18 @@ users 1 ---- * usage_logs
 ```
 
 - `users`: email, password hash (nullable for OAuth-only accounts), role, Google ID, creation time.
-- `notes`: owning user, title, content, optional embedding JSON, creation time.
-- `chats`: owning user, title, creation and update times.
-- `messages`: chat, role (`user` or `assistant`), content, creation time.
+- `notes`: required `userId` reference, title, content, optional numeric embedding vector, timestamps.
+- `chats`: required `userId` reference, title, embedded messages, creation and update times.
 - `usage_logs`: user, model, input/output token counts, estimated USD cost, creation time.
 
-See [LLD.md](./LLD.md) for columns, endpoint details, and validation rules.
+The `notes.userId` and `chats.userId` indexes support user-scoped retrieval. Usage records have indexes for per-user chronological history and global recent activity. User email and Google ID are unique indexes. See [LLD.md](./LLD.md) for schema and endpoint details.
 
 ## 6. Security and reliability
 
 - Passwords are hashed with bcryptjs and are never returned by API responses.
 - JWT signatures and expiry are verified; roles are reloaded from the database rather than trusted from client input.
 - New public registrations always receive the student role.
-- SQL statements use bound parameters; queries for private resources enforce ownership.
+- Queries for private resources include both the resource ID and authenticated owner ID.
 - Authentication, general API, and chat request rate limits are configured in the Express application.
 - JSON request bodies are limited in size; common fields and IDs are validated.
 - CORS uses a configured origin allowlist.
@@ -133,13 +131,11 @@ See [LLD.md](./LLD.md) for columns, endpoint details, and validation rules.
 - `npm start` first runs the frontend build, then starts Express.
 - Express serves `client/dist` and the API from port 3000 by default.
 
-Important configuration includes `PORT`, `CORS_ORIGIN`, `JWT_SECRET`, `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_EMBEDDING_MODEL`, token pricing, and optional Google OAuth settings. Refer to `.env.example` for the exact names.
+Important configuration includes `PORT`, `MONGODB_URI`, `CORS_ORIGIN`, `JWT_SECRET`, `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_EMBEDDING_MODEL`, token pricing, and optional Google OAuth settings. Refer to `.env.example` for the exact names.
 
 ## 8. Known design limits
 
-- SQLite is intended for a small learning project, not high-concurrency production deployment.
-- The in-memory `DatabaseSync` API is synchronous; a busy workload can block the Node.js event loop.
-- Note embeddings are stored directly as JSON and compared in application memory; this is appropriate only for a small note collection.
+- Note embeddings are stored as numeric arrays and compared in application memory; this is appropriate only for a small note collection.
 - Demo retrieval uses simple lexical overlap and is not semantic search.
 - Cost values are estimates based on configured prices, not provider invoices.
 - OAuth requires real Google credentials and a matching callback URL.

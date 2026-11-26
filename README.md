@@ -7,7 +7,7 @@ The app starts without an OpenAI key. In that case, chat and planner responses a
 ## Features
 
 - React, Vite, and React Router website with landing, login, registration, dashboard, chat, notes, planner, profile, and admin pages.
-- Express REST API, SQLite persistence, JWT authentication, bcrypt password hashing, and optional Google OAuth.
+- Express REST API, MongoDB persistence through Mongoose, JWT authentication, bcrypt password hashing, and optional Google OAuth.
 - Server-sent chat events, per-user chat history, note ownership checks, and private note retrieval.
 - OpenAI Responses API, function calling, JSON Schema study plans, embeddings, and estimated token costs.
 - Mock/demo behavior when the AI key is absent, plus built-in Node.js tests and a small LLM evaluation set.
@@ -15,8 +15,8 @@ The app starts without an OpenAI key. In that case, chat and planner responses a
 ## Technology
 
 - Frontend: React 18, Vite, React Router, Fetch API, CSS.
-- Backend: Node.js, Express, Passport Google OAuth.
-- Database: SQLite through Node.js `node:sqlite` (`DatabaseSync`).
+- Backend: Node.js, Express, Passport Google OAuth, and Mongoose.
+- Database: MongoDB, configured through `MONGODB_URI`.
 - AI: OpenAI Responses and embedding APIs.
 - Tests: Node.js built-in test runner and a keyword-based LLM evaluation script.
 
@@ -37,6 +37,13 @@ src/
   agent.js
   agent.test.js
   auth.js
+  db.js
+  models/
+    User.js
+    Note.js
+    Chat.js
+    UsageLog.js
+  models.test.js
   rag.js
   server.test.js
 prompts/
@@ -53,7 +60,8 @@ The design and product documents are [PRD.md](./PRD.md) (requirements), [HLD.md]
 
 ## Prerequisites and setup
 
-- Node.js 22.5 or later and npm (`node:sqlite` is built into Node; Node may show its experimental warning).
+- Node.js 20.19 or later and npm.
+- A local MongoDB instance or MongoDB Atlas database.
 - OpenAI API key only for live AI functionality. Demo mode works without one.
 
 From the project root:
@@ -66,6 +74,7 @@ For local configuration, copy `.env.example` to `.env` and edit the values:
 
 ```dotenv
 PORT=3000
+MONGODB_URI=mongodb://127.0.0.1:27017/mini-study-buddy
 CORS_ORIGIN=http://localhost:5173,http://localhost:3000
 JWT_SECRET=use-a-unique-random-value-at-least-32-characters-long
 OPENAI_API_KEY=
@@ -79,6 +88,8 @@ GOOGLE_CALLBACK_URL=http://localhost:3000/auth/google/callback
 ```
 
 `JWT_SECRET` must be at least 32 characters. If it is omitted, the server generates a secure temporary key and warns that sessions will stop working after a restart. Never commit `.env` or use example values as production credentials.
+
+`MONGODB_URI` is required. For local development, start MongoDB and use the local URI above. For MongoDB Atlas, create a database user, allow your machine's IP in Network Access, and put the Atlas connection string (including a database name) in `MONGODB_URI`. URL-encode special characters in the connection-string password. Keep the real URI only in your ignored `.env`.
 
 `CORS_ORIGIN` is a comma-separated allowlist. Add the exact origin that serves your hosted frontend before deployment.
 
@@ -102,8 +113,7 @@ npm start
 
 The `prestart` script builds the React app, then Express serves it at **http://localhost:3000**.
 
-The SQLite database is initialized automatically as `study-buddy.db` in the project root. It is ignored by Git. During tests, the server supports an alternate `DATABASE_PATH`.
-Existing databases from the earlier prototype are migrated on startup: stored usage is copied into the new usage table, and older notes without an owner remain unassigned and hidden rather than being exposed to any account.
+The application connects to MongoDB before listening and creates schema indexes through Mongoose. If MongoDB is unavailable or `MONGODB_URI` is missing, startup fails with an explicit error. The old ignored `study-buddy.db` file is not read or modified; existing SQLite records are not automatically imported.
 
 ## How to use
 
@@ -127,27 +137,26 @@ Google login is optional. If credentials are absent, the rest of the app works n
 ## Create a local admin account
 
 1. Register using the regular registration page. Public registration always assigns the `student` role.
-2. Stop the server.
-3. Use a local SQLite browser or SQLite CLI on `study-buddy.db` and run:
+2. Use `mongosh` with the same MongoDB database configured in `.env` and run:
 
-   ```sql
-   UPDATE users SET role='admin' WHERE email='you@example.com';
+   ```javascript
+   db.users.updateOne({ email: 'you@example.com' }, { $set: { role: 'admin' } });
    ```
 
-4. Restart the server and log in again so the API resolves your current database role.
+3. The API reloads the role from MongoDB on each request; refresh the application.
 
 Never expose an admin-promotion operation through public registration or an unauthenticated API.
 
 ## API overview
 
 - `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me`
-- `GET /api/notes`, `POST /api/notes`, `DELETE /api/notes/:id`
+- `GET /api/notes`, `GET /api/notes/:id`, `POST /api/notes`, `PUT`/`PATCH /api/notes/:id`, `DELETE /api/notes/:id`
 - `POST /api/chat` (SSE), `GET /api/chats`, `GET /api/chats/:id`, `DELETE /api/chats/:id`
 - `POST /api/study-plan`, `GET /api/usage`
 - Admin protected: `GET /api/admin/stats`, `/api/admin/users`, `/api/admin/usage`
 - Optional OAuth: `GET /auth/google`, `GET /auth/google/callback`
 
-Authentication uses a bearer JWT (or the HTTP-only OAuth cookie). Ownership is enforced in the API using the authenticated database user; frontend-supplied IDs or role claims are not authorization.
+Authentication uses a bearer JWT (or the HTTP-only OAuth cookie). Ownership is enforced in the API using the authenticated MongoDB user; frontend-supplied IDs or role claims are not authorization. Notes reference users through `userId`; chat messages are embedded in their owning chat; usage records reference users.
 
 ## Tests and evaluations
 
@@ -157,7 +166,7 @@ Run the test suite:
 npm test
 ```
 
-It includes unit tests for demo plans, retrieval scoping, and cost estimates, plus API integration tests for registration validation, protected/admin endpoints, note and chat ownership, SSE demo chat, and the planner fallback.
+It includes unit tests for demo plans, retrieval scoping, vector embeddings, and cost estimates, plus API integration tests against an ephemeral MongoDB server for registration validation, protected/admin endpoints, note CRUD and ownership, SSE demo chat, and the planner fallback.
 
 Run the LLM evaluation set when an OpenAI key is available:
 
@@ -183,12 +192,12 @@ npm run build
 | 4 | Multi-step agent | `src/agent.js` decides whether to use a plan tool, validates/executes it, and streams a follow-up response with an iteration limit of one tool call. |
 | 5 | Prompt engineering | `prompts/tutor.md`, loaded by `src/agent.js`; asks for beginner-friendly, concise explanations and examples. |
 | 6 | Prompt injection awareness and defenses | `prompts/tutor.md`, `src/agent.js`, and `server.js`; untrusted input and notes are marked as data, tool input is validated, and sensitive operations remain server-side. These defenses are not perfect. |
-| 7 | RAG: embeddings and retrieval | `src/rag.js`; note embeddings are saved as JSON, cosine similarity ranks notes, fallback lexical matching works without a key, and queries are owner-scoped. |
+| 7 | RAG: embeddings and retrieval | `src/rag.js`; numeric embedding vectors are saved in MongoDB, cosine similarity ranks notes, fallback lexical matching works without a key, and queries are owner-scoped. |
 | 8 | Streaming responses | `server.js` emits SSE; `client/src/App.jsx` reads and progressively displays events, errors, sources, and completion. |
 | 9 | Structured outputs | `src/agent.js` requests a strict JSON Schema plan and validates task fields and total duration before returning it. |
 | 10 | Token and cost monitoring | `src/agent.js` reads provider usage and estimates cost; `server.js` persists per-user records; dashboard and admin pages display estimates. |
-| 11 | Input validation and SQL safety | `server.js` validates email, text, durations, and IDs; SQL uses bound parameters; API errors are explicit. |
-| 12 | JWT issuance and verification | `server.js` issues expiring JWTs; `src/auth.js` verifies them and reloads user role from SQLite. |
+| 11 | Input validation and database safety | `server.js` validates email, text, durations, and MongoDB ObjectIds; Mongoose schemas validate persisted data and API errors are explicit. |
+| 12 | JWT issuance and verification | `server.js` issues expiring JWTs; `src/auth.js` verifies them and reloads user role from MongoDB. |
 | 13 | OAuth / third-party login | `server.js` optionally configures Google OAuth with environment secrets, Passport state checking, verified email, and HTTP-only JWT cookie. |
 | 14 | Password hashing | `server.js` hashes passwords with bcryptjs cost factor 12 and never returns hashes. |
 | 15 | Rate limiting | `server.js` applies general API, auth-attempt, and chat request limits plus a JSON body-size limit. |
@@ -201,7 +210,6 @@ npm run build
 - Prompt injection defenses reduce risk but cannot guarantee that a model will ignore adversarial content.
 - Demo-mode retrieval is simple word overlap, not semantic search. Live embedding/API failures are surfaced rather than silently described as AI success.
 - Cost calculations depend on manually configured rates and are estimates. Demo requests are not represented as paid AI usage.
-- The built-in SQLite module is experimental in Node.js 22.5–25 and Node may print an experimental warning at startup.
 - Google OAuth needs real credentials and an externally reachable callback for hosted deployment.
 #   m i n i - s t u d y - b u d d y  
  
